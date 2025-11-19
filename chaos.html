@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Energy in Chaos | GPU Visualization</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Courier New', Courier, monospace; }
+        canvas { display: block; }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        #title {
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 24px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 4px;
+            text-shadow: 0 0 10px rgba(0, 150, 255, 0.5);
+        }
+        #stats { position: relative !important; top: auto !important; left: auto !important; }
+        .controls-hint {
+            color: rgba(255,255,255,0.5);
+            font-size: 12px;
+            margin-top: 10px;
+            background: rgba(0,0,0,0.5);
+            padding: 10px;
+            border-left: 2px solid #00ffff;
+            max-width: 300px;
+            pointer-events: auto;
+        }
+        button {
+            pointer-events: auto;
+            background: transparent;
+            border: 1px solid #00ffff;
+            color: #00ffff;
+            padding: 10px 20px;
+            cursor: pointer;
+            font-family: inherit;
+            text-transform: uppercase;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+        }
+        button:hover { background: #00ffff; color: #000; box-shadow: 0 0 15px #00ffff; }
+        #loading {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ffff;
+            font-size: 20px;
+            pointer-events: none;
+            transition: opacity 0.5s;
+        }
+    </style>
+    <!-- Import Maps for Modules -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+<div id="loading">INITIALIZING GPU KERNELS...</div>
+<div id="ui-layer">
+    <div>
+        <div id="title">Energy in Chaos</div>
+        <div class="controls-hint">
+            • Left Click: Rotate<br>
+            • Right Click: Pan<br>
+            • Scroll: Zoom<br>
+            • GUI: Tweak Physics & Visuals<br>
+            <button id="audio-btn">Enable Audio Reactivity</button>
+        </div>
+    </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+import Stats from 'three/addons/libs/stats.module.js';
+
+// --- CONFIGURATION ---
+const SETTINGS = {
+    preset: 'High',
+    particleCount: 0, // Set by preset
+    textureSize: 512, // Set by preset
+    bloomStrength: 1.5,
+    bloomRadius: 0.4,
+    bloomThreshold: 0.1,
+    cursorInteraction: true,
+    curlStrength: 2.5,
+    noiseScale: 1.5,
+    speed: 1.0,
+    dieSpeed: 0.015,
+    colorA: '#ff4d00', // Magma/Energy
+    colorB: '#0066ff', // Electric
+    particleSize: 1.0,
+    cameraMode: 'Orbit', // Orbit, Cinematic
+    audioReactive: false
+};
+
+const PRESETS = {
+    'Low': 256,    // 65k particles
+    'Medium': 512, // 262k particles
+    'High': 700,   // 500k particles (Balanced)
+    'Ultra': 1024  // 1M particles (GPU Heavy)
+};
+
+// --- GLOBALS ---
+let scene, camera, renderer, composer, controls, stats, gui;
+let gpuCompute;
+let positionVariable, velocityVariable;
+let particleUniforms;
+let geometry, material, mesh;
+let audioContext, analyser, dataArray;
+let time = 0;
+let mouse = new THREE.Vector2(-10000, -10000);
+let windowHalfX = window.innerWidth / 2;
+let windowHalfY = window.innerHeight / 2;
+
+const clock = new THREE.Clock();
+
+// --- SHADERS ---
+
+// 1. GPGPU Simulation Fragment Shaders
+const fragmentShaderVelocity = `
+    uniform float time;
+    uniform float delta; // about 0.016
+    uniform float speed;
+    uniform float curlStrength;
+    uniform float noiseScale;
+    uniform float dieSpeed;
+    uniform vec2 mouse;
+    uniform float audioLevel;
+
+    // Pseudo-random generator
+    float rand(vec2 co){
+        return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+    }
+
+    // Simplex Noise (3D) - Standard implementation
+    vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+    vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+    vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+    vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+    float snoise(vec3 v) {
+        const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
+        const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+
+        // First corner
+        vec3 i  = floor(v + dot(v, C.yyy) );
+        vec3 x0 = v - i + dot(i, C.xxx) ;
+
+        // Other corners
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min( g.xyz, l.zxy );
+        vec3 i2 = max( g.xyz, l.zxy );
+
+        //   x0 = x0 - 0.0 + 0.0 * C.xxx;
+        //   x1 = x0 - i1  + 1.0 * C.xxx;
+        //   x2 = x0 - i2  + 2.0 * C.xxx;
+        //   x3 = x0 - 1.0 + 3.0 * C.xxx;
+        vec3 x1 = x0 - i1 + C.xxx;
+        vec3 x2 = x0 - i2 + C.yyy; // 2.0*C.x = 1/3 = C.y
+        vec3 x3 = x0 - D.yyy;      // -1.0+3.0*C.x = -0.5 = -D.y
+
+        // Permutations
+        i = mod289(i);
+        vec4 p = permute( permute( permute(
+                    i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
+                + i.y + vec4(0.0, i1.y, i2.y, 1.0 ))
+                + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+
+        // Gradients: 7x7 points over a square, mapped onto an octahedron.
+        // The ring size 17*17 = 289 is close to a multiple of 49 (49*6 = 294)
+        float n_ = 0.142857142857; // 1.0/7.0
+        vec3  ns = n_ * D.wyz - D.xzx;
+
+        vec4 j = p - 49.0 * floor(p * ns.z * ns.z);  //  mod(p,7*7)
+
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_ );    // mod(j,N)
+
+        vec4 x = x_ *ns.x + ns.yyyy;
+        vec4 y = y_ *ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+
+        vec4 b0 = vec4( x.xy, y.xy );
+        vec4 b1 = vec4( x.zw, y.zw );
+
+        //vec4 s0 = vec4(lessThan(b0,0.0))*2.0 - 1.0;
+        //vec4 s1 = vec4(lessThan(b1,0.0))*2.0 - 1.0;
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+
+        vec3 p0 = vec3(a0.xy,h.x);
+        vec3 p1 = vec3(a0.zw,h.y);
+        vec3 p2 = vec3(a1.xy,h.z);
+        vec3 p3 = vec3(a1.zw,h.w);
+
+        //Normalise gradients
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+        p0 *= norm.x;
+        p1 *= norm.y;
+        p2 *= norm.z;
+        p3 *= norm.w;
+
+        // Mix final noise value
+        vec4 m = max(0.5 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 105.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1),
+                                    dot(p2,x2), dot(p3,x3) ) );
+    }
+
+    vec3 curlNoise(vec3 p) {
+        const float e = 0.1;
+        float n1 = snoise(p + vec3(e, 0, 0));
+        float n2 = snoise(p - vec3(e, 0, 0));
+        float n3 = snoise(p + vec3(0, e, 0));
+        float n4 = snoise(p - vec3(0, e, 0));
+        float n5 = snoise(p + vec3(0, 0, e));
+        float n6 = snoise(p - vec3(0, 0, e));
+
+        float x = n3 - n4 - n5 + n6;
+        float y = n5 - n6 - n1 + n2;
+        float z = n1 - n2 - n3 + n4;
+        return normalize(vec3(x, y, z));
+    }
+
+    void main() {
+        vec2 uv = gl_FragCoord.xy / resolution.xy;
+        vec4 tmpPos = texture2D( texturePosition, uv );
+        vec4 tmpVel = texture2D( textureVelocity, uv );
+
+        vec3 pos = tmpPos.xyz;
+        vec3 vel = tmpVel.xyz;
+        float life = tmpPos.w; // Life stored in position alpha
+
+        // Curl Noise Advection
+        float reactionScale = 1.0 + audioLevel * 2.0;
+        vec3 curl = curlNoise(pos * noiseScale * 0.1 + time * 0.1);
+        
+        // Target velocity based on curl field
+        vec3 targetVel = curl * (curlStrength * reactionScale);
+        
+        // Mouse interaction (repel)
+        float d = distance(pos.xy, mouse);
+        if (d < 50.0) {
+            vec3 dir = normalize(pos - vec3(mouse, 0.0));
+            targetVel += dir * 20.0 * (1.0 - d/50.0);
+        }
+
+        // Smoothly interpolate velocity
+        vel = mix(vel, targetVel, 0.05 * speed);
+
+        // Decay Logic
+        life -= dieSpeed * (1.0 + rand(uv + time) * 0.5);
+        
+        // Respawn if dead
+        if ( life < 0.0 ) {
+            vel = vec3(0.0); // Reset velocity
+        }
+
+        gl_FragColor = vec4(vel, 0.0);
+    }
+`;
+
+const fragmentShaderPosition = `
+    uniform float delta;
+    uniform float time;
+    // textureVelocity is injected automatically by GPUComputationRenderer
+
+    // Pseudo-random generator
+    float rand(vec2 co){
+        return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+    }
+
+    void main() {
+        vec2 uv = gl_FragCoord.xy / resolution.xy;
+        vec4 tmpPos = texture2D( texturePosition, uv );
+        vec4 tmpVel = texture2D( textureVelocity, uv );
+
+        vec3 pos = tmpPos.xyz;
+        vec3 vel = tmpVel.xyz;
+        float life = tmpPos.w;
+
+        // Move
+        pos += vel * delta;
+
+        // Decay life
+        life -= 0.005; // Base decay
+
+        // Respawn logic
+        if (life < 0.0) {
+            // Reset to random position within a sphere or box
+            float r = rand(uv + time) * 100.0;
+            float theta = rand(uv + time + 10.0) * 6.28;
+            float phi = rand(uv + time + 20.0) * 3.14;
+            
+            pos.x = r * sin(phi) * cos(theta);
+            pos.y = r * sin(phi) * sin(theta);
+            pos.z = r * cos(phi);
+            
+            life = 1.0; // Reset life
+        }
+
+        gl_FragColor = vec4(pos, life);
+    }
+`;
+
+// 2. Visual Rendering Shaders (Instanced Billboards)
+const renderVertexShader = `
+    uniform sampler2D texturePosition;
+    uniform sampler2D textureVelocity;
+    uniform float size;
+    uniform vec3 colorA;
+    uniform vec3 colorB;
+    
+    attribute vec2 reference; // UV coordinate in the FBO
+    
+    varying vec3 vColor;
+    varying float vLife;
+    varying vec2 vUv;
+
+    void main() {
+        vUv = uv;
+        
+        // Read Position and Velocity from GPGPU Textures
+        vec4 posData = texture2D(texturePosition, reference);
+        vec3 velData = texture2D(textureVelocity, reference).xyz;
+        
+        vec3 pos = posData.xyz;
+        vLife = posData.w;
+
+        // Orientation logic: Stretch billboards based on velocity
+        vec3 viewPosition = (modelViewMatrix * vec4(pos, 1.0)).xyz;
+        
+        // Calculate velocity in view space for stretching
+        vec3 velView = (viewMatrix * vec4(velData, 0.0)).xyz;
+        float speed = length(velData);
+        
+        // Color mixing based on speed/energy
+        float t = smoothstep(0.0, 5.0, speed);
+        vColor = mix(colorB, colorA, t);
+
+        // Billboard logic + Stretching
+        // Base scale
+        float currentSize = size * (0.5 + 0.5 * sin(vLife * 3.14)); // Fade in/out
+        
+        // Create a basis for the quad
+        // Standard billboard: Right and Up vectors relative to camera
+        vec3 cameraRight = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+        vec3 cameraUp = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+
+        // Stretch factor
+        float stretch = max(1.0, speed * 2.0);
+        vec3 stretchDir = normalize(velData + vec3(0.0001)); // Avoid zero div
+        
+        // Rotate the quad to align with velocity? 
+        // Simplified: Just use standard billboard for now but scale width by velocity roughly?
+        // A true trail requires aligning geometry to velocity vector.
+        // Approximate:
+        vec3 offset = position.x * cameraRight * currentSize * 1.0 
+                    + position.y * cameraUp * currentSize * stretch;
+
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        mvPosition.xyz += offset;
+
+        gl_Position = projectionMatrix * mvPosition;
+    }
+`;
+
+const renderFragmentShader = `
+    varying vec3 vColor;
+    varying float vLife;
+    varying vec2 vUv;
+
+    void main() {
+        // Circular particle shape
+        vec2 cxy = 2.0 * vUv - 1.0;
+        float r = dot(cxy, cxy);
+        
+        if (r > 1.0) discard;
+
+        // Soft glow falloff
+        float alpha = 1.0 - r;
+        alpha = pow(alpha, 2.0); // sharpen
+
+        gl_FragColor = vec4(vColor, alpha * vLife);
+    }
+`;
+
+function init() {
+    // Container
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    // Renderer
+    renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000000);
+    // Enable float textures for GPGPU
+    if ( !renderer.capabilities.isWebGL2 && !renderer.extensions.get( "OES_texture_float" ) ) {
+        alert( "No OES_texture_float support for float textures." );
+        return;
+    }
+    container.appendChild(renderer.domElement);
+
+    // Scene & Camera
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x000000, 0.002);
+
+    camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1, 1000);
+    camera.position.set(0, 0, 300);
+
+    // Stats
+    stats = new Stats();
+    document.getElementById('ui-layer').appendChild(stats.dom);
+
+    // Controls
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 0.5;
+
+    // Initialize
+    initComputeRenderer();
+    initParticles();
+    initPostProcessing();
+    initGUI();
+    initAudio();
+
+    // Events
+    window.addEventListener('resize', onWindowResize);
+    document.addEventListener('mousemove', onDocumentMouseMove);
+    
+    document.getElementById('loading').style.opacity = 0;
+    
+    animate();
+}
+
+function initComputeRenderer() {
+    // Determine texture size based on preset
+    const size = SETTINGS.textureSize;
+    SETTINGS.particleCount = size * size;
+
+    gpuCompute = new GPUComputationRenderer(size, size, renderer);
+
+    if ( renderer.capabilities.isWebGL2 === false ) {
+        gpuCompute.setDataType( THREE.HalfFloatType );
+    }
+
+    const dtPosition = gpuCompute.createTexture();
+    const dtVelocity = gpuCompute.createTexture();
+    fillTextures(dtPosition, dtVelocity);
+
+    positionVariable = gpuCompute.addVariable("texturePosition", fragmentShaderPosition, dtPosition);
+    velocityVariable = gpuCompute.addVariable("textureVelocity", fragmentShaderVelocity, dtVelocity);
+
+    gpuCompute.setVariableDependencies(positionVariable, [positionVariable, velocityVariable]);
+    gpuCompute.setVariableDependencies(velocityVariable, [positionVariable, velocityVariable]);
+
+    particleUniforms = {
+        time: { value: 0.0 },
+        delta: { value: 0.0 },
+        speed: { value: SETTINGS.speed },
+        curlStrength: { value: SETTINGS.curlStrength },
+        noiseScale: { value: SETTINGS.noiseScale },
+        dieSpeed: { value: SETTINGS.dieSpeed },
+        mouse: { value: new THREE.Vector2(-10000, -10000) },
+        audioLevel: { value: 0.0 }
+    };
+
+    velocityVariable.material.uniforms = particleUniforms;
+    positionVariable.material.uniforms.delta = { value: 0.0 };
+    positionVariable.material.uniforms.time = { value: 0.0 };
+
+    // Inject GLSL utility functions for noise if not using includes (we embedded them in shader string)
+
+    const error = gpuCompute.init();
+    if (error !== null) {
+        console.error(error);
+    }
+}
+
+function fillTextures(texturePosition, textureVelocity) {
+    const posArray = texturePosition.image.data;
+    const velArray = textureVelocity.image.data;
+
+    for (let k = 0, kl = posArray.length; k < kl; k += 4) {
+        // Position: Random sphere
+        const r = Math.random() * 100;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.random() * Math.PI;
+
+        posArray[k + 0] = r * Math.sin(phi) * Math.cos(theta);
+        posArray[k + 1] = r * Math.sin(phi) * Math.sin(theta);
+        posArray[k + 2] = r * Math.cos(phi);
+        posArray[k + 3] = Math.random(); // Life
+
+        // Velocity: Start zero
+        velArray[k + 0] = 0;
+        velArray[k + 1] = 0;
+        velArray[k + 2] = 0;
+        velArray[k + 3] = 0;
+    }
+}
+
+function initParticles() {
+    // Geometry: A simple quad for each particle (InstancedBuffer)
+    // We use a PlaneBufferGeometry as the base, and replicate it.
+    const baseGeometry = new THREE.PlaneGeometry(1, 1);
+    geometry = new THREE.InstancedBufferGeometry();
+    
+    geometry.index = baseGeometry.index;
+    geometry.attributes.position = baseGeometry.attributes.position;
+    geometry.attributes.uv = baseGeometry.attributes.uv;
+
+    // References to FBO pixels
+    const references = new Float32Array(SETTINGS.particleCount * 2);
+    const width = SETTINGS.textureSize;
+    
+    for (let i = 0; i < SETTINGS.particleCount; i++) {
+        const x = (i % width) / width;
+        const y = Math.floor(i / width) / width;
+        references[i * 2] = x;
+        references[i * 2 + 1] = y;
+    }
+
+    geometry.setAttribute('reference', new THREE.InstancedBufferAttribute(references, 2));
+
+    material = new THREE.ShaderMaterial({
+        uniforms: {
+            texturePosition: { value: null },
+            textureVelocity: { value: null },
+            size: { value: SETTINGS.particleSize },
+            colorA: { value: new THREE.Color(SETTINGS.colorA) },
+            colorB: { value: new THREE.Color(SETTINGS.colorB) }
+        },
+        vertexShader: renderVertexShader,
+        fragmentShader: renderFragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+    });
+
+    mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false; // GPU moves points, CPU doesn't know bounds
+    scene.add(mesh);
+}
+
+function restartSimulation() {
+    // Determine size based on preset
+    SETTINGS.textureSize = PRESETS[SETTINGS.preset];
+    
+    // Cleanup old
+    scene.remove(mesh);
+    geometry.dispose();
+    
+    // Re-init
+    initComputeRenderer();
+    initParticles();
+}
+
+function initPostProcessing() {
+    const renderScene = new RenderPass(scene, camera);
+
+    const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+    bloomPass.threshold = SETTINGS.bloomThreshold;
+    bloomPass.strength = SETTINGS.bloomStrength;
+    bloomPass.radius = SETTINGS.bloomRadius;
+
+    composer = new EffectComposer(renderer);
+    composer.addPass(renderScene);
+    composer.addPass(bloomPass);
+}
+
+function initAudio() {
+    document.getElementById('audio-btn').addEventListener('click', async (e) => {
+        e.target.style.display = 'none';
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioContext.createMediaStreamSource(stream);
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 64;
+            source.connect(analyser);
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+            SETTINGS.audioReactive = true;
+            console.log("Audio initialized");
+        } catch (err) {
+            console.error("Audio init failed:", err);
+            alert("Could not access microphone. Ensure site has permission.");
+        }
+    });
+}
+
+function initGUI() {
+    gui = new GUI({ title: 'Simulation Config' });
+
+    const perfFolder = gui.addFolder('Performance & Display');
+    perfFolder.add(SETTINGS, 'preset', Object.keys(PRESETS)).name('Quality').onChange(restartSimulation);
+    perfFolder.add(SETTINGS, 'cameraMode', ['Orbit', 'Cinematic']).name('Camera Mode');
+    
+    const simFolder = gui.addFolder('Physics / Chaos');
+    simFolder.add(SETTINGS, 'speed', 0.0, 5.0).name('Time Scale');
+    simFolder.add(SETTINGS, 'curlStrength', 0.0, 10.0).name('Turbulence');
+    simFolder.add(SETTINGS, 'noiseScale', 0.1, 5.0).name('Noise Freq');
+    simFolder.add(SETTINGS, 'dieSpeed', 0.001, 0.1).name('Decay Rate');
+
+    const visualFolder = gui.addFolder('Visuals');
+    visualFolder.addColor(SETTINGS, 'colorA').name('Core Color').onChange(c => material.uniforms.colorA.value.set(c));
+    visualFolder.addColor(SETTINGS, 'colorB').name('Outer Color').onChange(c => material.uniforms.colorB.value.set(c));
+    visualFolder.add(SETTINGS, 'particleSize', 0.1, 5.0).onChange(v => material.uniforms.size.value = v);
+    visualFolder.add(SETTINGS, 'bloomStrength', 0.0, 3.0).onChange(v => composer.passes[1].strength = v);
+}
+
+function onWindowResize() {
+    windowHalfX = window.innerWidth / 2;
+    windowHalfY = window.innerHeight / 2;
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function onDocumentMouseMove(event) {
+    if (!SETTINGS.cursorInteraction) return;
+    // Project mouse to world space roughly for shader
+    // For 2D plane mapping:
+    mouse.x = (event.clientX - windowHalfX);
+    mouse.y = -(event.clientY - windowHalfY);
+}
+
+function updateCamera(delta) {
+    if (SETTINGS.cameraMode === 'Cinematic') {
+        controls.enabled = false;
+        const t = Date.now() * 0.0002;
+        camera.position.x = Math.sin(t) * 200;
+        camera.position.y = Math.cos(t * 0.5) * 100;
+        camera.position.z = Math.cos(t) * 200 + 100;
+        camera.lookAt(0, 0, 0);
+    } else {
+        controls.enabled = true;
+        controls.update();
+    }
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    stats.update();
+
+    const delta = clock.getDelta();
+    time += delta;
+
+    // Audio Analysis
+    let avgAudio = 0;
+    if (SETTINGS.audioReactive && analyser) {
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for(let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+        avgAudio = sum / dataArray.length / 255.0; // Normalize 0-1
+    }
+
+    // Update Simulation Uniforms
+    particleUniforms.time.value = time;
+    particleUniforms.delta.value = delta;
+    particleUniforms.speed.value = SETTINGS.speed;
+    particleUniforms.curlStrength.value = SETTINGS.curlStrength;
+    particleUniforms.noiseScale.value = SETTINGS.noiseScale;
+    particleUniforms.dieSpeed.value = SETTINGS.dieSpeed;
+    particleUniforms.mouse.value.copy(mouse);
+    particleUniforms.audioLevel.value = avgAudio; // Inject audio into shader
+
+    // GPGPU Compute Step
+    gpuCompute.compute();
+
+    // Bind computed textures to render material
+    material.uniforms.texturePosition.value = gpuCompute.getCurrentRenderTarget(positionVariable).texture;
+    material.uniforms.textureVelocity.value = gpuCompute.getCurrentRenderTarget(velocityVariable).texture;
+
+    // Camera Logic
+    updateCamera(delta);
+
+    // Render
+    // renderer.render(scene, camera); // Raw
+    composer.render(); // Post-processed
+}
+
+init();
+
+</script>
+</body>
+</html>
