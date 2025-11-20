@@ -1,173 +1,65 @@
-# Energy in Chaos: GPU-Accelerated Lagrangian Particle Advection
+# Energy in Chaos
+**Interactive GPU Visualization**
 
-**Author:**  
-[Your Name / Entity]
-
-**Tech Stack:**  
-WebGL2 • Three.js • GLSL • GPGPU
-
-**License:**  
-MIT
+*   **Author:** AIT OIHMANE Lahsen
+*   **Tech Stack:** WebGL2, Three.js, GLSL, GPGPU
+*   **License:** MIT
 
 ---
 
-## 1. Abstract
+### Project Profile
 
-**Energy in Chaos** is a real-time, interactive visualization of a turbulent flow-field simulation running entirely on the GPU.  
-By using **GPGPU (General-Purpose computing on Graphics Processing Units)** techniques, the system can animate up to **10⁶ particles at 60 FPS in a web browser**.
+A real-time, interactive visualization of turbulent flow fields, running entirely in the browser. This project demonstrates advanced use of GPGPU (General-Purpose computing on Graphics Processing Units) to simulate and render up to one million particles at a smooth 60 FPS. The system creates fluid-like, chaotic motion and dynamic energy visuals without relying on a traditional game engine or backend server.
 
-Instead of solving the full Navier–Stokes equations, the simulation employs **Curl Noise potentials** to generate **divergence-free velocity fields**, producing fluid-like motion with drastically lower computational cost.
+### Key Features
 
----
+*   **Massive Scale:** Efficiently simulates and renders up to 1,000,000 particles in real-time.
+*   **GPU-Accelerated Physics:** All particle physics are calculated on the GPU using fragment shaders, freeing the CPU for other tasks.
+*   **Divergence-Free Flow:** Employs a Curl Noise algorithm to generate realistic, incompressible fluid-like motion where particles form vortices instead of collapsing.
+*   **Audio Reactivity:** The visualization can react to live microphone input, with particle energy and turbulence responding to sound levels.
+*   **Dynamic Visuals:** Features a vibrant neon aesthetic achieved with HDR rendering, additive blending, and a bloom post-processing effect.
+*   **Interactive Controls:** Users can rotate, pan, and zoom the camera. A mouse cursor can also repel particles, creating interactive disturbances.
+*   **Highly Scalable:** Includes performance presets (Low, Medium, High, Ultra) to dynamically adjust the particle count for different hardware capabilities.
 
-## 2. Theoretical Framework
+### Technical Implementation
 
-### 2.1 Divergence-Free Velocity Fields
-
-To mimic an incompressible fluid, the simulation must obey the constraint:
-
-\[
-\nabla \cdot \vec{v} = 0
-\]
-
-Standard Perlin/Simplex noise does not satisfy this and produces sinks/sources.  
-To fix this, a **Curl Noise** field is constructed using a vector potential:
-
-\[
-\vec{v} = \nabla \times \vec{\psi}
-\]
-
-By vector calculus identity:
-
-\[
-\nabla \cdot (\nabla \times \vec{\psi}) = 0
-\]
-
-This guarantees **zero divergence**, producing natural swirling vortices and circulation patterns characteristic of real fluids.
-
-The idea originates from the **Helmholtz–Hodge decomposition**, ensuring the velocity field is purely solenoidal.
+*   **GPGPU Simulation:** Uses Three.js's `GPUComputationRenderer` to run simulation logic on the GPU. Particle state (position, velocity, life) is stored in floating-point textures.
+*   **Ping-Pong Buffers:** A technique where the GPU reads from one texture and writes to a second texture each frame, then swaps them. This bypasses the limitation of not being able to read and write to the same texture simultaneously.
+*   **Instanced Rendering:** Renders a million particles using a single draw call by drawing one plane geometry and "instancing" it for each particle, with a shader positioning each instance individually.
+*   **Custom GLSL Shaders:**
+    *   **Velocity Shader:** Calculates the forces on each particle using curl noise, audio input, and mouse interaction.
+    *   **Position Shader:** Updates each particle's position based on its velocity and handles its lifecycle (respawning).
+    *   **Render Shader:** Visually renders each particle as a stretched, glowing billboard.
 
 ---
 
-### 2.2 Numerical Integration
+### How the Main Script Works
 
-The simulation follows a **Lagrangian** (particle-based) model.  
-Particle positions are updated using **semi-implicit Euler integration**:
+The main script (`script.js`) orchestrates the entire application in two main phases: initialization and the animation loop.
 
-\[
-P_{t+\Delta t} = P_t + \vec{v}(P_t,t)\Delta t
-\]
+#### 1. Initialization (`init()` function)
 
-Particles sample the curl noise velocity field at their current location.
+This function runs once at the start to set up the entire scene.
 
----
+1.  **Setup Core Three.js:** It creates the fundamental components: the `Scene` (the world), the `Camera` (the viewpoint), and the `Renderer` (the canvas that draws the scene).
+2.  **Initialize GPGPU (`initComputeRenderer`):**
+    *   It creates a special `GPUComputationRenderer`.
+    *   It defines two textures to hold particle data: one for `position` (x, y, z, life) and one for `velocity` (vx, vy, vz).
+    *   It assigns the GLSL code (the "shaders") that will run on the GPU to update these textures every frame.
+3.  **Create Particles (`initParticles`):**
+    *   It creates a single, tiny plane geometry.
+    *   It uses `InstancedBufferGeometry` to tell the GPU to draw this plane hundreds of thousands of times.
+    *   It creates a special `reference` attribute that tells each instance which pixel in the GPGPU texture corresponds to its data.
+4.  **Setup Post-Processing (`initPostProcessing`):** It creates an `EffectComposer` to manage post-processing effects, specifically adding an `UnrealBloomPass` to create the signature glow.
+5.  **Create GUI & Listeners:** It builds the on-screen control panel (`lil-gui`) and sets up event listeners for window resizing and mouse movement.
+6.  **Start the Loop:** Finally, it calls the `animate()` function for the first time, starting the continuous rendering cycle.
 
-## 3. Implementation Details
+#### 2. The Animation Loop (`animate()` function)
 
-### 3.1 GPGPU Architecture
+This function runs continuously, typically 60 times per second, to create the illusion of motion.
 
-WebGL cannot read and write to the same texture in a single pass, so the system uses **Ping-Pong Buffers**.
-
-All particle state is stored inside **floating-point textures (RGBA32F)**:
-
-- **Position Texture**
-  - R = x  
-  - G = y  
-  - B = z  
-  - A = life  
-
-- **Velocity Texture**
-  - R = vx  
-  - G = vy  
-  - B = vz  
-  - A = decay_rate  
-
-With texture size \( N \times N \), particle count becomes:
-
-\[
-N^2
-\]
-
-Example:  
-- \(1024^2 = 1,048,576\) particles  
-- \(700^2 \approx 490,000\) particles  
-
-Each frame:
-1. Read old state from buffer A  
-2. Compute next state in a fragment shader  
-3. Write to buffer B  
-4. Swap A and B  
-
----
-
-### 3.2 Shader Kernels
-
-#### **fragmentShaderVelocity**
-- Samples 3D simplex noise  
-- Computes numerical partial derivatives to approximate the curl  
-- Generates divergence-free velocity  
-- Applies:
-  - Audio reactivity  
-  - Mouse interaction forces  
-  - Velocity blending (drag/inertia)
-
-#### **fragmentShaderPosition**
-- Integrates position: `pos += vel * delta`  
-- Updates life/decay  
-- Respawns particles inside a sphere when `life < 0`  
-
-The entire physics system runs in the GPU’s fragment pipeline.
-
----
-
-### 3.3 Instanced Rendering Pipeline
-
-Rendering up to 1 million particles requires **Instanced Rendering** via `THREE.InstancedBufferGeometry`.
-
-**Geometry:** one quad (two triangles).  
-**Instancing:** GPU draws it \(10^6\) times in a single draw call.
-
-Each instance contains a **reference UV** into the position/velocity textures:
-
-
-The **vertex shader**:
-- Samples particle position & velocity  
-- Builds a **camera-facing billboard**  
-- Applies **velocity-based stretching** for motion-blur appearance  
-
----
-
-### 3.4 Post-Processing (HDR + Bloom)
-
-Particles are rendered with **HDR brightness** (>1.0).  
-A multi-pass **UnrealBloomPass** extracts bright regions and spreads them across the frame, creating:
-- Neon-like glow  
-- Plasma effects  
-- Intense energetic highlights  
-
----
-
-## 4. Performance Scaling
-
-The simulation supports dynamic presets:
-
-| Preset | Texture Size | Particle Count | Target Hardware |
-|--------|--------------|----------------|-----------------|
-| **Low** | 256×256 | 65,536 | Mobile / iGPU |
-| **Medium** | 512×512 | 262,144 | Entry-level dGPU |
-| **High** | 700×700 | ~490,000 | Mid-range PC |
-| **Ultra** | 1024×1024 | 1,048,576 | High-end GPUs (RTX 3060+) |
-
-Changing the preset reallocates GPU buffers in real time.
-
----
-
-## 5. Dependencies
-
-- **Three.js (r160)** — Rendering engine  
-- **GPUComputationRenderer** — GPGPU simulation helper  
-- **UnrealBloomPass** — Post-processing bloom  
-- **lil-gui** — Live parameter controls  
-
----
-
+1.  **Update Uniforms:** It gathers current data—like the elapsed time, mouse position, and audio levels—and sends this data to the GPU shaders.
+2.  **Compute Simulation Step:** It calls `gpuCompute.compute()`. This command tells the GPU to execute the simulation shaders (Velocity and Position) for one frame. The GPU reads the particle data from the input textures, calculates the new state, and writes the results to the output textures.
+3.  **Update Render Material:** It takes the newly updated position and velocity textures from the GPGPU renderer and passes them to the visual particle material.
+4.  **Render the Scene:** It tells the `EffectComposer` to render the final image. This involves drawing all the instanced particles using their new positions and then applying the bloom effect.
+5.  **Repeat:** It calls `requestAnimationFrame(animate)`, which is a browser API that schedules the `animate` function to be run again just before the next screen repaint.
